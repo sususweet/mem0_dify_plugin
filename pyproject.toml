@@ -11,6 +11,7 @@ dependencies = [
   "rank-bm25",
   "psycopg[binary,pool]",
   "dify_plugin",
+  "psycopg2-binary",
   "tiktoken",
   "cohere>=6.1.0",
 ]

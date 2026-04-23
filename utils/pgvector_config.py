@@ -10,6 +10,7 @@ Reference: Mem0 pgvector configuration documentation
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
@@ -22,6 +23,28 @@ from .constants import (
 from .logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _prefer_psycopg2_under_gevent() -> bool:
+    """Return True if we should prefer psycopg2 pool under gevent.
+
+    psycopg3 uses a wait callback that integrates with event loops/selectors.
+    Under gevent monkey-patching, psycopg3's selector-based waiting can raise
+    errors such as "FD is already registered" and can leave connections in a
+    "another command is already in progress" state on error paths.
+
+    psycopg2 uses blocking I/O and tends to be more robust in gevent-patched,
+    thread-per-request execution models (like Dify's tool validation threads).
+    """
+    try:
+        from gevent import monkey  # type: ignore
+
+        return any(
+            monkey.is_module_patched(mod)
+            for mod in ("socket", "selectors", "thread", "threading")
+        )
+    except Exception:
+        return False
 
 
 def _extract_pool_parameters(
@@ -135,8 +158,15 @@ def _create_connection_pool(
         ConnectionPool object, or None if creation failed.
 
     """
-    # Try psycopg3 first
-    if psycopg3_available:
+    prefer_psycopg2 = _prefer_psycopg2_under_gevent()
+    if prefer_psycopg2 and psycopg2_available:
+        logger.info(
+            "Detected gevent monkey patching; preferring psycopg2 ThreadedConnectionPool "
+            "over psycopg3 ConnectionPool for pgvector stability."
+        )
+
+    # Try psycopg3 first (unless we prefer psycopg2 under gevent)
+    if psycopg3_available and not (prefer_psycopg2 and psycopg2_available):
         try:
             from psycopg_pool import ConnectionPool
 
@@ -172,11 +202,41 @@ def _create_connection_pool(
         try:
             from psycopg2.pool import ThreadedConnectionPool
 
-            connection_pool = ThreadedConnectionPool(
+            raw_pool = ThreadedConnectionPool(
                 minconn=pool_params["min_size"],
                 maxconn=pool_params["max_size"],
                 dsn=connection_string,
             )
+
+            class _Psycopg2PoolAdapter:
+                """Adapt psycopg2 ThreadedConnectionPool to mem0's expected pool API.
+
+                mem0's pgvector backend expects a pool object with a .connection()
+                context manager (psycopg3-style). psycopg2 pools provide getconn/putconn,
+                so we wrap it with a compatible interface.
+                """
+
+                def __init__(self, pool: ThreadedConnectionPool) -> None:
+                    self._pool = pool
+
+                @contextlib.contextmanager
+                def connection(self):  # noqa: ANN201
+                    conn = self._pool.getconn()
+                    try:
+                        yield conn
+                    finally:
+                        # Always return to pool; mem0 handles commit/rollback itself.
+                        with contextlib.suppress(Exception):
+                            self._pool.putconn(conn)
+
+                def close(self) -> None:
+                    # psycopg3 pool uses close(); provide same name.
+                    self._pool.closeall()
+
+                def closeall(self) -> None:
+                    self._pool.closeall()
+
+            connection_pool = _Psycopg2PoolAdapter(raw_pool)
 
             logger.info(
                 "Created psycopg2 ThreadedConnectionPool: minconn=%d, maxconn=%d. "

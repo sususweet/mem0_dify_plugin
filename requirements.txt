@@ -4,6 +4,7 @@ azure-identity
 langchain-neo4j
 rank-bm25
 psycopg[binary,pool]  # psycopg3 with connection pool support
+psycopg2-binary  # fallback pool for gevent-patched environments
 dify_plugin
 tiktoken  # Accurate token counting for conversation processing
 cohere>=6.1.0
